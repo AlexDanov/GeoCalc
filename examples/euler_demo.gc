@@ -1,0 +1,39 @@
+# Drag base points on the canvas.
+A = Point(-150, -150)
+B = Point(250, -150)
+C = Point(180, 150)
+
+AB = A | B
+BC = B | C
+AC = A | C
+
+L = B + (C - B) / 2
+M = A + (B - A) / 2
+N = A + (C - A) / 2
+
+CM = C | M
+BN = B | N
+D = CM & BN
+
+OM_axis = M | ~AB
+ON_axis = N | ~AC
+O = OM_axis & ON_axis
+OM = M | O
+ON = N | O
+
+E = AB & (C | ~AB)
+F = AC & (B | ~AC)
+CE = C | E
+BF = B | F
+H = CE & BF
+
+c9 = Circle(E, M, N)
+P, R = c9
+
+OH = O | H
+
+print(D in OH, P in OH)
+print(L in c9)
+print(f"AB = {abs(AB):.1f}")
+print(f"AC = {abs(AC):.1f}")
+print(f"BC = {abs(BC):.1f}")
