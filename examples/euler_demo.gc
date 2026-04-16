@@ -1,7 +1,7 @@
 # Drag base points on the canvas.
-A = Point(-150, -150)
-B = Point(250, -150)
-C = Point(180, 150)
+A = Point(-1.5, -1.5)
+B = Point(2.5, -1.5)
+C = Point(1.8, 1.5)
 
 AB = A | B
 BC = B | C

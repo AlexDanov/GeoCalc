@@ -1,52 +1,34 @@
 from __future__ import annotations
 
+import math
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 
 from geometry.dsl import DSLExecutionError, DSLRunner
 from geometry.primitives import Circle, Line, Point, SceneSnapshot, Vector
 
 
-DEFAULT_CODE = """# Drag base points on the canvas.
-A = Point(-150, -150)
-B = Point(250, -150)
-C = Point(180, 150)
-
+FALLBACK_CODE = """A = Point(-1.5, -1.5)
+B = Point(2.5, -1.5)
+C = Point(1.8, 1.5)
 AB = A | B
 BC = B | C
 AC = A | C
-
-L = B + (C - B) / 2
-M = A + (B - A) / 2
-N = A + (C - A) / 2
-
-CM = C | M
-BN = B | N
-D = CM & BN
-
-OM_axis = M | ~AB
-ON_axis = N | ~AC
-O = OM_axis & ON_axis
-OM = M | O
-ON = N | O
-
-E = AB & (C | ~AB)
-F = AC & (B | ~AC)
-CE = C | E
-BF = B | F
-H = CE & BF
-
-c9 = Circle(E, M, N)
-P, R = c9
-
-OH = O | H
-
-print(D in OH, P in OH)
-print(L in c9)
-print(f"AB = {abs(AB):.1f}")
-print(f"AC = {abs(AC):.1f}")
-print(f"BC = {abs(BC):.1f}")
+print(f"AB = {abs(AB):.1f}, BC = {abs(BC):.1f}, AC = {abs(AC):.1f}")
 """
+
+DEFAULT_VIEWPORT = {"scale": 1.0, "offset_x": 0.0, "offset_y": 0.0}
+MIN_CANVAS_SIZE = 100
+
+
+def load_default_code() -> str:
+    candidate = Path(__file__).resolve().parents[1] / "examples" / "euler_demo.gc"
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except OSError:
+        return FALLBACK_CODE
+    return text if text.strip() else FALLBACK_CODE
 
 
 class GeoCalcApp:
@@ -67,21 +49,27 @@ class GeoCalcApp:
         self.code_after_id: str | None = None
         self.label_after_id: str | None = None
         self.overrides: dict[str, tuple[float, float]] = {}
-        self.viewport = {"scale": 1.0, "offset_x": 0.0, "offset_y": 0.0}
+        self.viewport = dict(DEFAULT_VIEWPORT)
         self.view_fitted_once = False
         self.visible_line_segments: list[tuple[float, float, float, float]] = []
         self.visible_circles: list[tuple[float, float, float]] = []
         self.visible_points_for_labels: list[tuple[str, float, float]] = []
-        self.sidebar_width = 360
+        self.sidebar_width = 400
         self.user_resized_sidebar = False
+        self.pane_dragging_sash = False
+        self.grid_target_px = 44.0
+        self.layout_initialized = False
+        self.last_root_size: tuple[int, int] = (0, 0)
         self.label_layout_cache: dict[str, tuple[float, float, str]] = {}
         self.label_animation_targets: dict[str, tuple[float, float, str]] = {}
         self.label_animation_after_id: str | None = None
         self.label_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self.last_source_text = ""
 
         self._build_ui()
         self._bind_events()
-        self.editor.insert("1.0", DEFAULT_CODE)
+        self.editor.insert("1.0", load_default_code())
+        self.root.after_idle(self._schedule_initial_sidebar_layout)
         self.rebuild_scene(fit=True)
 
     def _build_ui(self) -> None:
@@ -113,13 +101,26 @@ class GeoCalcApp:
         toolbar = ttk.Frame(self.sidebar)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         toolbar.columnconfigure(1, weight=1)
+        toolbar.columnconfigure(2, weight=0)
 
         run_button = ttk.Button(toolbar, text="Run  F5 / Ctrl+Enter", command=self.rebuild_scene)
         run_button.grid(row=0, column=0, sticky="w")
 
+        options = ttk.Frame(toolbar)
+        options.grid(row=0, column=1, columnspan=2, sticky="e")
+
         self.autorun_var = tk.BooleanVar(value=True)
-        autorun = ttk.Checkbutton(toolbar, text="Auto-run", variable=self.autorun_var)
-        autorun.grid(row=0, column=1, sticky="e")
+        autorun = ttk.Checkbutton(options, text="Auto-run", variable=self.autorun_var)
+        autorun.grid(row=0, column=0, sticky="e", padx=(0, 8))
+
+        self.show_intermediates_var = tk.BooleanVar(value=False)
+        show_intermediates = ttk.Checkbutton(
+            options,
+            text="Show intermediates",
+            variable=self.show_intermediates_var,
+            command=self.render_scene,
+        )
+        show_intermediates.grid(row=0, column=1, sticky="e")
 
         self.editor = tk.Text(
             self.sidebar,
@@ -157,6 +158,7 @@ class GeoCalcApp:
         self.canvas.bind("<B1-Motion>", self._drag_point)
         self.canvas.bind("<ButtonRelease-1>", self._stop_drag)
         self.canvas.bind("<Control-MouseWheel>", self._zoom_canvas)
+        self.main_pane.bind("<ButtonPress-1>", self._on_pane_press)
         self.main_pane.bind("<B1-Motion>", self._on_pane_drag)
         self.main_pane.bind("<ButtonRelease-1>", self._on_pane_release)
 
@@ -175,6 +177,10 @@ class GeoCalcApp:
     def _on_root_configure(self, event=None):
         if event is not None and event.widget is not self.root:
             return
+        size = (self.root.winfo_width(), self.root.winfo_height())
+        if size == self.last_root_size:
+            return
+        self.last_root_size = size
         self._apply_sidebar_width()
 
     def _on_canvas_configure(self, event=None):
@@ -192,56 +198,55 @@ class GeoCalcApp:
             self.code_after_id = None
 
         source = self.editor.get("1.0", "end-1c")
+        if source != self.last_source_text and not self.dragging:
+            self.overrides.clear()
+            self.last_source_text = source
+
         try:
             result = self.runner.execute(source, overrides=self.overrides)
         except DSLExecutionError as exc:
-            self.last_error = str(exc)
-            if self.last_good_scene is not None:
-                self.status_var.set(f"Last valid drawing kept. {self.last_error}")
-                self.current_scene = self.last_good_scene
-                self.render_scene()
-            else:
-                self.status_var.set(self.last_error)
-                self.canvas.delete("all")
+            self._handle_execution_error(str(exc))
             return
 
         self.current_scene = result.scene
         self.last_good_scene = result.scene
         self.last_error = ""
 
-        for name, point in result.scene.draggable_points.items():
-            self.overrides[name] = (point.x, point.y)
+        self._sync_draggable_overrides(result.scene)
 
-        if fit or self.viewport["scale"] == 1.0 and self.viewport["offset_x"] == 0.0 and self.viewport["offset_y"] == 0.0:
+        if fit or self._is_default_viewport():
             self._fit_viewport(result.scene)
-            if self.canvas.winfo_width() > 100 and self.canvas.winfo_height() > 100:
+            if self.canvas.winfo_width() > MIN_CANVAS_SIZE and self.canvas.winfo_height() > MIN_CANVAS_SIZE:
                 self.view_fitted_once = True
 
-        log_suffix = ""
-        if result.scene.logs:
-            log_suffix = " | " + "".join(result.scene.logs).strip().replace("\n", " | ")
-        self.status_var.set(
-            f"Scene updated: {len(result.scene.points)} points, "
-            f"{len(result.scene.lines)} lines, {len(result.scene.circles)} circles{log_suffix}"
-        )
+        self.status_var.set(self._format_scene_status(result.scene))
         self.render_scene()
         if not self.dragging:
             self._schedule_label_refresh()
 
     def _apply_sidebar_width(self) -> None:
-        total_width = self.root.winfo_width()
-        if total_width <= 0:
+        total_width = self.main_pane.winfo_width()
+        total_height = self.main_pane.winfo_height()
+        if total_width <= 1 or total_height <= 1:
             return
-        default_width = max(320, int(total_width * 0.25))
+        default_width = max(320, int(total_width * 0.33))
         desired_sidebar_width = self.sidebar_width if self.user_resized_sidebar else default_width
         max_sidebar_width = max(280, total_width - 500)
         desired_sidebar_width = min(max(desired_sidebar_width, 280), max_sidebar_width)
         self.sidebar_width = desired_sidebar_width
         canvas_width = max(300, total_width - desired_sidebar_width)
-        self.root.after_idle(lambda: self.main_pane.sash_place(0, canvas_width, 0))
+        self.main_pane.sash_place(0, canvas_width, 0)
+        self.layout_initialized = True
+
+    def _schedule_initial_sidebar_layout(self) -> None:
+        if self.layout_initialized:
+            return
+        self._apply_sidebar_width()
+        if not self.layout_initialized:
+            self.root.after(40, self._schedule_initial_sidebar_layout)
 
     def _capture_sidebar_width(self) -> None:
-        total_width = self.root.winfo_width()
+        total_width = self.main_pane.winfo_width()
         if total_width <= 0:
             return
         try:
@@ -253,11 +258,27 @@ class GeoCalcApp:
         self.sidebar_width = min(max(width, 280), max_sidebar_width)
         self.user_resized_sidebar = True
 
+    def _on_pane_press(self, event=None):
+        if event is None:
+            self.pane_dragging_sash = False
+            return
+        try:
+            sash_x, _ = self.main_pane.sash_coord(0)
+        except tk.TclError:
+            self.pane_dragging_sash = False
+            return
+        self.pane_dragging_sash = abs(event.x - sash_x) <= 12
+
     def _on_pane_drag(self, event=None):
+        if not self.pane_dragging_sash:
+            return
         self._capture_sidebar_width()
 
     def _on_pane_release(self, event=None):
+        if not self.pane_dragging_sash:
+            return
         self._capture_sidebar_width()
+        self.pane_dragging_sash = False
 
     def _fit_viewport(self, scene: SceneSnapshot):
         points = [(point.x, point.y) for point in scene.points]
@@ -269,11 +290,11 @@ class GeoCalcApp:
                 ]
             )
         if not points:
-            self.viewport = {"scale": 1.0, "offset_x": 0.0, "offset_y": 0.0}
+            self.viewport = dict(DEFAULT_VIEWPORT)
             return
 
-        width = max(self.canvas.winfo_width(), 100)
-        height = max(self.canvas.winfo_height(), 100)
+        width = max(self.canvas.winfo_width(), MIN_CANVAS_SIZE)
+        height = max(self.canvas.winfo_height(), MIN_CANVAS_SIZE)
         min_x = min(x for x, _ in points)
         max_x = max(x for x, _ in points)
         min_y = min(y for _, y in points)
@@ -283,7 +304,7 @@ class GeoCalcApp:
         span_y = max(max_y - min_y, 1.0)
         padding = 50
         scale = min((width - 2 * padding) / span_x, (height - 2 * padding) / span_y)
-        scale = max(scale, 0.2)
+        scale = min(max(scale, 50.0), 100.0)
 
         center_x = (min_x + max_x) / 2
         center_y = (min_y + max_y) / 2
@@ -322,10 +343,32 @@ class GeoCalcApp:
             return
 
         for circle in scene.circles:
+            if not self._should_draw_primitive(
+                primitive_id=id(circle),
+                visible_ids=scene.visible_circle_ids,
+                hidden_ids=scene.hidden_circle_ids,
+            ):
+                continue
             self._draw_circle(circle)
         for line in scene.lines:
+            if not self._should_draw_primitive(
+                primitive_id=id(line),
+                visible_ids=scene.visible_line_ids,
+                hidden_ids=scene.hidden_line_ids,
+            ):
+                continue
             self._draw_line(line)
-        points = sorted(scene.points, key=lambda point: point.draggable)
+
+        points: list[Point] = []
+        for point in scene.points:
+            if not self._should_draw_primitive(
+                primitive_id=id(point),
+                visible_ids=scene.visible_point_ids,
+                hidden_ids=scene.hidden_point_ids,
+            ):
+                continue
+            points.append(point)
+        points.sort(key=lambda point: point.draggable)
         for point in points:
             name = scene.point_names.get(id(point))
             px, py = self.world_to_screen(point.x, point.y)
@@ -334,28 +377,50 @@ class GeoCalcApp:
             self._draw_point(point, scene.point_names.get(id(point)))
 
     def _draw_grid(self, width: int, height: int) -> None:
-        step = max(25, int(self.viewport["scale"] * 50))
-        if step <= 0:
+        step_world = self._grid_step_world()
+        if step_world <= 0:
             return
-        for x in range(0, width, step):
-            self.canvas.create_line(x, 0, x, height, fill="#ece9e1")
-        for y in range(0, height, step):
-            self.canvas.create_line(0, y, width, y, fill="#ece9e1")
+
+        x_min, y_max = self.screen_to_world(0, 0)
+        x_max, y_min = self.screen_to_world(width, height)
+
+        first_x = math.ceil(x_min / step_world) * step_world
+        x = first_x
+        while x <= x_max + 1e-9:
+            sx, _ = self.world_to_screen(x, 0.0)
+            self.canvas.create_line(sx, 0, sx, height, fill="#ece9e1")
+            x += step_world
+
+        first_y = math.ceil(y_min / step_world) * step_world
+        y = first_y
+        while y <= y_max + 1e-9:
+            _, sy = self.world_to_screen(0.0, y)
+            self.canvas.create_line(0, sy, width, sy, fill="#ece9e1")
+            y += step_world
+
         ax1, ay1 = self.world_to_screen(-10000, 0)
         ax2, ay2 = self.world_to_screen(10000, 0)
-        self.canvas.create_line(ax1, ay1, ax2, ay2, fill="#c8c4b7", width=1)
+        self.canvas.create_line(ax1, ay1, ax2, ay2, fill="#b8b4a8", width=2)
         bx1, by1 = self.world_to_screen(0, -10000)
         bx2, by2 = self.world_to_screen(0, 10000)
-        self.canvas.create_line(bx1, by1, bx2, by2, fill="#c8c4b7", width=1)
+        self.canvas.create_line(bx1, by1, bx2, by2, fill="#b8b4a8", width=2)
 
     def _draw_line(self, line: Line, label: str | None = None) -> None:
+        is_segment = not getattr(line.p1, "hidden", False) and not getattr(line.p2, "hidden", False)
+        if is_segment:
+            x1, y1 = self.world_to_screen(line.p1.x, line.p1.y)
+            x2, y2 = self.world_to_screen(line.p2.x, line.p2.y)
+            self.canvas.create_line(x1, y1, x2, y2, fill="#3f546a", width=3)
+            self.visible_line_segments.append((x1, y1, x2, y2))
+            return
+
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         p1 = self._clip_line_to_viewport(line, width, height)
         if p1 is None:
             return
         x1, y1, x2, y2 = p1
-        self.canvas.create_line(x1, y1, x2, y2, fill="#506680", width=2)
+        self.canvas.create_line(x1, y1, x2, y2, fill="#8b97a6", width=1)
         self.visible_line_segments.append((x1, y1, x2, y2))
 
     def _clip_line_to_viewport(self, line: Line, width: int, height: int):
@@ -397,7 +462,7 @@ class GeoCalcApp:
         radius = 6 if point.draggable else 5
         fill = "#1f2933"
         outline = "#146356" if point.draggable else "#f7f7f4"
-        outline_width = 2 if point.draggable else 2
+        outline_width = 2
         if point.draggable and label:
             hit_radius = 14
             hit_id = self.canvas.create_oval(
@@ -458,6 +523,8 @@ class GeoCalcApp:
     def _drag_point(self, event):
         if self.dragging and self.drag_point_name:
             x, y = self.screen_to_world(event.x, event.y)
+            if self._is_shift_pressed(event):
+                x, y = self._snap_world_to_grid(x, y)
             self.overrides[self.drag_point_name] = (x, y)
             self.coords_var.set(f"{self.drag_point_name} = ({x:.1f}, {y:.1f})")
             self._schedule_label_refresh()
@@ -500,7 +567,7 @@ class GeoCalcApp:
             return "break"
         zoom = 1.1 if event.delta > 0 else 1 / 1.1
         old_scale = self.viewport["scale"]
-        new_scale = min(max(old_scale * zoom, 0.05), 20.0)
+        new_scale = min(max(old_scale * zoom, 5.0), 300.0)
         if abs(new_scale - old_scale) < 1e-9:
             return "break"
 
@@ -510,6 +577,49 @@ class GeoCalcApp:
         self.viewport["offset_y"] = event.y + world_y * new_scale
         self.render_scene()
         return "break"
+
+    @staticmethod
+    def _is_shift_pressed(event) -> bool:
+        return bool(getattr(event, "state", 0) & 0x0001)
+
+    def _is_default_viewport(self) -> bool:
+        return all(self.viewport[key] == value for key, value in DEFAULT_VIEWPORT.items())
+
+    def _should_draw_primitive(
+        self,
+        *,
+        primitive_id: int,
+        visible_ids: set[int],
+        hidden_ids: set[int],
+    ) -> bool:
+        if primitive_id in hidden_ids:
+            return False
+        if self.show_intermediates_var.get():
+            return True
+        return primitive_id in visible_ids
+
+    def _sync_draggable_overrides(self, scene: SceneSnapshot) -> None:
+        for name, point in scene.draggable_points.items():
+            self.overrides[name] = (point.x, point.y)
+
+    def _format_scene_status(self, scene: SceneSnapshot) -> str:
+        log_suffix = ""
+        if scene.logs:
+            log_suffix = " | " + "".join(scene.logs).strip().replace("\n", " | ")
+        return (
+            f"Scene updated: {len(scene.points)} points, "
+            f"{len(scene.lines)} lines, {len(scene.circles)} circles{log_suffix}"
+        )
+
+    def _handle_execution_error(self, error_text: str) -> None:
+        self.last_error = error_text
+        if self.last_good_scene is not None:
+            self.status_var.set(f"Last valid drawing kept. {self.last_error}")
+            self.current_scene = self.last_good_scene
+            self.render_scene()
+            return
+        self.status_var.set(self.last_error)
+        self.canvas.delete("all")
 
     def _get_point_label_position(self, label: str | None, x: float, y: float) -> tuple[float, float, str]:
         if not label:
@@ -738,6 +848,30 @@ class GeoCalcApp:
         radius: float,
     ) -> float:
         return abs((((px - cx) ** 2 + (py - cy) ** 2) ** 0.5) - radius)
+
+    def _grid_step_world(self) -> float:
+        scale = max(self.viewport["scale"], 1e-9)
+        raw_step = self.grid_target_px / scale
+        exponent = math.floor(math.log10(max(raw_step, 1e-9)))
+        base = 10 ** exponent
+        normalized = raw_step / base
+        if normalized <= 1.0:
+            nice = 1.0
+        elif normalized <= 2.0:
+            nice = 2.0
+        elif normalized <= 5.0:
+            nice = 5.0
+        else:
+            nice = 10.0
+        return nice * base
+
+    def _snap_world_to_grid(self, x: float, y: float) -> tuple[float, float]:
+        step = self._grid_step_world()
+        if step <= 0:
+            return x, y
+        snapped_x = round(x / step) * step
+        snapped_y = round(y / step) * step
+        return snapped_x, snapped_y
 
     @staticmethod
     def _label_box(x: float, y: float, label: str) -> tuple[float, float, float, float]:

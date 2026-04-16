@@ -1,0 +1,48 @@
+A = Point(-200, -180)
+B = A + Vector(420, 0)
+C = B + Vector(-80, 340)
+
+AB = A | B
+BC = B | C
+AC = A | C
+
+L = mid(B, C)
+M = mid(A, B)
+N = mid(A, C)
+
+CM = C | M
+BN = B | N
+D = CM & BN
+
+OM_line = M | ~AB
+ON_line = N | ~AC
+O = OM_line & ON_line
+
+E = AB & (C | ~AB)
+F = AC & (B | ~AC)
+CE = C | E
+BF = B | F
+H = CE & BF
+
+c9 = E | M | N
+P, R = c9
+euler = O | H
+
+circumcircle = O | abs(A - O)
+c2 = B | (abs(BC) * 0.55)
+X, Y = circumcircle & c2
+XY = X | Y
+
+parallel_to_bc = A // BC
+mirror_of_a = A @ BC
+t1, t2 = B % c9
+
+trisectors = bisect(B, A, C, 3)
+ts1, ts2 = trisectors
+
+print(D in euler, P in euler)
+print(L in c9)
+print(f"AB={abs(AB):.1f}, BC={abs(BC):.1f}, AC={abs(AC):.1f}")
+print(f"dist(A, BC)={dist(A, BC):.1f}")
+print(f"angle(B, A, C)={angle(B, A, C):.1f}")
+print(mirror_of_a)
